@@ -1,6 +1,6 @@
 /* FlashFlood Lab — offline service worker (WeatherNext family convention).
-   CACHE_VERSION format: flashflood-lab-20260705111316<YYYYMMDDhhmm> */
-const CACHE_VERSION = "flashflood-lab-20260705111316";
+   CACHE_VERSION format: flashflood-lab-20260705122226<YYYYMMDDhhmm> */
+const CACHE_VERSION = "flashflood-lab-20260705122226";
 const CORE = [
   "./",
   "./index.html",
