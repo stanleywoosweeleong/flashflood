@@ -517,7 +517,7 @@
    family + custom + GPS, all in one state.locations array.
    Single-file, offline-first, bilingual (ZH default). No fabrication.
 =========================================================== */
-const CACHE_VERSION = 'modelduel-20260706-02';
+const CACHE_VERSION = 'modelduel-20260706-04';
 const STORE_KEY = 'modelduel-v1-state';
 const NS = 'modelduel';
 
@@ -850,6 +850,7 @@ const I18N={
     wsHint:'请检查网址是否正确、Worker 是否已部署。',
     autoLogLabel:'每日自动记录（开启应用时）',
     autoRunning:(d,n)=>`驾驶模式记录中… ${d}/${n}`,autoDone:n=>`已记录 ${n} 个地点 ✓`,
+    autoDoneSome:(d,n,f)=>`已完成 ${d}/${n} · ${f} 个失败（网络繁忙，稍后可再跑一次补上）`,
     autoStopped:(d,n)=>`已暂停（${d}/${n} · 再按继续）`,
     alOff:'关闭 / Off',alActive:'仅当前地点 / Active farm',alRegion:r=>`${r}（整区）`,alAll:'全部地点 / All farms',
     driveNow:'立即记录全部（驾驶模式）',
@@ -936,6 +937,7 @@ const I18N={
     wsHint:'Check the URL is correct and the Worker is deployed.',
     autoLogLabel:'Auto-log daily (on open)',
     autoRunning:(d,n)=>`Drive mode… ${d}/${n}`,autoDone:n=>`Logged ${n} location(s) ✓`,
+    autoDoneSome:(d,n,f)=>`Done ${d}/${n} · ${f} failed (network busy — run again later to fill them in)`,
     autoStopped:(d,n)=>`Paused (${d}/${n} · tap to resume)`,
     alOff:'Off',alActive:'Active farm only',alRegion:r=>`${r} (whole region)`,alAll:'All farms',
     driveNow:'Log all now (drive mode)',
@@ -1316,7 +1318,7 @@ async function fetchMETviaProxy(lat,lon,chosenTown){
   const base=(state.settings.metProxy||'').replace(/\/+$/,'');
   if(!base) throw new Error('no-proxy');
   const q=chosenTown?`town=${encodeURIComponent(chosenTown)}&lat=${lat}&lon=${lon}`:`lat=${lat}&lon=${lon}`;
-  const r=await fetch(`${base}/forecast?${q}`);
+  const r=await fetchRetry(`${base}/forecast?${q}`);
   if(!r.ok) throw new Error('proxy '+r.status);
   const j=await r.json();               // { town, km, days:[{date,rain,morning,afternoon,night}] }
   const met={},metP={};
@@ -1349,7 +1351,7 @@ async function fetchECMWFforecast(lat,lon,thresh){
   // daily (for amount) AND hourly (for time-of-day periods)
   const u=`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`+
     `&daily=precipitation_sum&hourly=precipitation&forecast_days=7&models=${model}&timezone=Asia%2FKuala_Lumpur`;
-  const r=await fetch(u);if(!r.ok) throw new Error('challenger '+r.status);
+  const r=await fetchRetry(u);if(!r.ok) throw new Error('challenger '+r.status);
   const j=await r.json();const out={};
   // hourly map: "YYYY-MM-DDTHH:00" → mm
   const hours={};
@@ -1364,7 +1366,7 @@ async function fetchECMWFforecast(lat,lon,thresh){
 async function fetchERA5actuals(lat,lon,from,to,thresh){
   const u=`https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}`+
     `&start_date=${from}&end_date=${to}&daily=precipitation_sum&hourly=precipitation&timezone=Asia%2FKuala_Lumpur`;
-  const r=await fetch(u);if(!r.ok) throw new Error('era5 '+r.status);
+  const r=await fetchRetry(u);if(!r.ok) throw new Error('era5 '+r.status);
   const j=await r.json();const out={};
   const hours={};
   (j.hourly?.time||[]).forEach((tkey,i)=>{ hours[tkey.slice(0,13)+':00']=j.hourly.precipitation[i]; });
@@ -1421,7 +1423,12 @@ async function logOneFarm(loc, thresh){
     }
   }
   loc.metTown=metTown;
-  return {gotMet,metTown,noProxy};
+  // Did we capture anything for TODAY specifically? (truthful success signal —
+  // old log entries from previous days must not count as "logged today")
+  const today=todayYMD();
+  const tday=lg[today]||{};
+  const gotToday=(tday.met!=null)||(tday.ecmwf!=null);
+  return {gotMet,metTown,noProxy,gotToday};
 }
 
 /* ===================== LOG TODAY (manual, active farm, with UI) ============== */
@@ -1448,6 +1455,21 @@ function alreadyLoggedToday(){ return localStorage.getItem(LOGDAY_KEY)===todayYM
 
 const DRIVE_GAP_MS=250;            // deliberate pacing, gentle on Open-Meteo / Worker
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+/* Fetch with retry+backoff on throttle (429/503) — a full 114-farm run hammers
+   Open-Meteo and the MET Worker, so transient rate-limits are expected. Retry a
+   couple of times with jittered cooldown before giving up on a farm. */
+async function fetchRetry(url, tries=3){
+  let lastErr;
+  for(let i=0;i<tries;i++){
+    try{
+      const r=await fetch(url);
+      if(r.status===429||r.status===503){ lastErr=new Error('throttle '+r.status);
+        await sleep(700*(i+1)+Math.random()*400); continue; }
+      return r;
+    }catch(e){ lastErr=e; await sleep(500*(i+1)+Math.random()*300); }
+  }
+  throw lastErr||new Error('fetch failed');
+}
 let driveRunning=false, driveAbort=false;
 
 /* Drive-mode batch (RainScore/RainLog mechanism): logs a set of farms slowly,
@@ -1475,6 +1497,7 @@ async function driveLog(farms, thresh){
   await acquireWake();
 
   let done=0, failed=0, skipped=0;
+  const failedNames=[];
   const report=()=>status(t.autoRunning(done+skipped,farms.length),'warn');
   report();
 
@@ -1484,10 +1507,10 @@ async function driveLog(farms, thresh){
     const lg=state.log[loc.id]||{};
     if(lg[todayYMD()] && lg[todayYMD()].met!=null){ skipped++; report(); continue; }
     try{
-      await logOneFarm(loc,thresh);
-      const r=state.log[loc.id];
-      if(r && Object.keys(r).length>0) done++; else failed++;
-    }catch(e){ failed++; }
+      const res=await logOneFarm(loc,thresh);
+      if(res && res.gotToday) done++;
+      else { failed++; failedNames.push(loc.name); }
+    }catch(e){ failed++; failedNames.push(loc.name); }
     report();
     if(!wake) await acquireWake();            // restore lock if dropped while hidden
     if(loc.id===activeLoc){ try{ runDuel(); }catch(_){} }  // live-refresh active farm
@@ -1503,8 +1526,9 @@ async function driveLog(farms, thresh){
   if(activeLoc){ try{ runDuel(); }catch(_){} }
   if(rankCardOpen) renderRanking();
   if(driveAbort) status(t.autoStopped(done+skipped,farms.length),'warn');
+  else if(failed>0) status(t.autoDoneSome(done+skipped, farms.length, failed),'warn');
   else status(t.autoDone(done+skipped),'ok');
-  return {done,failed,skipped};
+  return {done,failed,skipped,failedNames};
 }
 
 /* Per-region refetch (↻ on the region header). Updates every farm in that
@@ -2108,6 +2132,11 @@ async function driveAllNow(){
   if(mode.startsWith('region:')){ const r=mode.slice(7); farms=farms.filter(l=>(l.region||'')===r); }
   // 'off' or 'active' → default to all farms for a manual full run
   if(!farms.length) farms=state.locations.filter(l=>!l.deleted);
+  if(!farms.length){ status(T().selectFirst,'warn'); return; }
+  // The status/progress banner lives on the main page — close Settings so the
+  // farmer can actually see the drive-mode progress and result.
+  closeSettings();
+  window.scrollTo({top:0,behavior:'smooth'});
   await driveLog(farms,thresh);
   stampLogDay();
   renderLocList();
